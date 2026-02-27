@@ -1333,6 +1333,16 @@ decode QUADRANT default Unknown::unknown() {
             }
         }
 
+        0x02: decode FUNCT3 {
+            format Load {
+                0x3: decode RVTYPE {
+                    0x1: fake_load({{
+                        Rd_sd = Mem_sd;
+                    }});
+                }
+            }
+        }
+
         0x03: decode FUNCT3 {
             format FenceOp {
                 0x0: fence({{
@@ -2061,6 +2071,16 @@ decode QUADRANT default Unknown::unknown() {
                 }}, {{
                     EA = Rs1 + Vs2_ud[vs2ElemIdx];
                 }}, inst_flags=SimdIndexedStoreOp);
+            }
+        }
+
+        0x0a: decode FUNCT3 {
+            format Store {
+                0x3: decode RVTYPE {
+                    0x1: fake_store({{
+                        Mem_ud = Rs2_ud;
+                    }});
+                }
             }
         }
 

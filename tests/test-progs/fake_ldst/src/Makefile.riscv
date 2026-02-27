@@ -1,0 +1,10 @@
+CC = clang
+CFLAGS ?= --target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d -O0 -nostdlib -static -fuse-ld=lld
+
+all: fake_ldst
+
+fake_ldst: fake_ldst.S
+	$(CC) $(CFLAGS) -o $@ $<
+
+clean:
+	rm -f fake_ldst

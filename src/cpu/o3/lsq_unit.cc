@@ -40,6 +40,7 @@
  */
 
 #include "cpu/o3/lsq_unit.hh"
+#include "arch/riscv/insts/static_inst.hh"
 
 #include "arch/generic/debugfaults.hh"
 #include "base/str.hh"
@@ -59,6 +60,17 @@ namespace gem5
 
 namespace o3
 {
+
+namespace
+{
+
+const std::string &
+fakeInstName(const DynInstPtr &inst)
+{
+    return inst->staticInst->getName();
+}
+
+} // anonymous namespace
 
 LSQUnit::WritebackEvent::WritebackEvent(const DynInstPtr &_inst,
         PacketPtr _pkt, LSQUnit *lsq_ptr)
@@ -196,6 +208,7 @@ LSQUnit::LSQUnit(uint32_t lqEntries, uint32_t sqEntries)
       cacheBlockMask(0), stalled(false),
       isStoreBlocked(false), storeInFlight(false), stats(nullptr)
 {
+    fakeStoreBuffer.fill(FakeStoreBufferEntry{});
 }
 
 void
@@ -238,6 +251,93 @@ LSQUnit::resetState()
     stalled = false;
 
     cacheBlockMask = ~(cpu->cacheLineSize() - 1);
+    fakeStoreBuffer.fill(FakeStoreBufferEntry{});
+    fakeStoreBufferHead = 0;
+}
+
+bool
+LSQUnit::isFakeLoad(const DynInstPtr &inst) const
+{
+    return fakeInstName(inst) == "fake_load";
+}
+
+bool
+LSQUnit::isFakeStore(const DynInstPtr &inst) const
+{
+    return fakeInstName(inst) == "fake_store";
+}
+
+LSQUnit::FakeStoreSignature
+LSQUnit::getFakeStoreSignature(const DynInstPtr &inst) const
+{
+    auto *riscv_inst = dynamic_cast<const RiscvISA::RiscvStaticInst *>(
+        inst->staticInst.get());
+    assert(riscv_inst);
+
+    FakeStoreSignature sig;
+    sig.rs1 = riscv_inst->machInst.rs1;
+    const uint16_t imm12 = (riscv_inst->machInst.imm7 << 5) |
+                           riscv_inst->machInst.imm5;
+    sig.offset = sext<12>(imm12);
+    return sig;
+}
+
+void
+LSQUnit::updateFakeStoreBuffer(const DynInstPtr &inst, const uint8_t *data,
+                               size_t size)
+{
+    if (!isFakeStore(inst) || size < sizeof(uint64_t) || !data) {
+        return;
+    }
+
+    auto &entry = fakeStoreBuffer[fakeStoreBufferHead];
+    entry.valid = true;
+    entry.sig = getFakeStoreSignature(inst);
+    entry.seqNum = inst->seqNum;
+    std::memcpy(&entry.data, data, sizeof(uint64_t));
+
+    DPRINTF(LSQUnit,
+            "fake_store_buffer push [sn:%llu] rs1=%u off=%d data=%#llx slot=%u\n",
+            inst->seqNum, entry.sig.rs1, entry.sig.offset, entry.data,
+            fakeStoreBufferHead);
+
+    fakeStoreBufferHead = (fakeStoreBufferHead + 1) % FakeStoreBufferSize;
+}
+
+bool
+LSQUnit::tryFakeStoreBufferForward(const DynInstPtr &load_inst,
+                                   const FakeStoreSignature &sig,
+                                   const RequestPtr &req)
+{
+    if (!isFakeLoad(load_inst)) {
+        return false;
+    }
+
+    for (unsigned i = 0; i < FakeStoreBufferSize; ++i) {
+        const unsigned idx = (fakeStoreBufferHead + FakeStoreBufferSize - 1 - i) %
+                             FakeStoreBufferSize;
+        const auto &entry = fakeStoreBuffer[idx];
+        if (!entry.valid || !(entry.sig == sig)) {
+            continue;
+        }
+
+        if (!load_inst->memData) {
+            load_inst->memData = new uint8_t[req->getSize()];
+        }
+        std::memcpy(load_inst->memData, &entry.data, req->getSize());
+
+        PacketPtr data_pkt = new Packet(req, MemCmd::ReadReq);
+        data_pkt->dataStatic(load_inst->memData);
+        WritebackEvent *wb = new WritebackEvent(load_inst, data_pkt, this);
+        cpu->schedule(wb, curTick());
+
+        DPRINTF(LSQUnit,
+                "fake_load matched fake_store_buffer [sn:%llu] <- [sn:%llu] rs1=%u off=%d data=%#llx\n",
+                load_inst->seqNum, entry.seqNum, sig.rs1, sig.offset, entry.data);
+        return true;
+    }
+
+    return false;
 }
 
 std::string
@@ -1405,6 +1505,61 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
         return NoFault;
     }
 
+    if (isFakeLoad(load_inst)) {
+        const auto sig = getFakeStoreSignature(load_inst);
+        bool inflight_match = false;
+
+        auto fake_store_it = load_inst->sqIt;
+        while (fake_store_it != storeWBIt) {
+            fake_store_it--;
+            if (!fake_store_it->valid()) {
+                continue;
+            }
+            const DynInstPtr &store_inst = fake_store_it->instruction();
+            if (!isFakeStore(store_inst)) {
+                continue;
+            }
+            if (!(getFakeStoreSignature(store_inst) == sig)) {
+                continue;
+            }
+
+            inflight_match = true;
+            auto *riscv_store = dynamic_cast<const RiscvISA::RiscvStaticInst *>(
+                store_inst->staticInst.get());
+            const uint16_t rs2 = riscv_store->machInst.rs2;
+            DPRINTF(LSQUnit,
+                    "fake_load inflight match [sn:%llu] <- [sn:%llu], rs2=x%u (addi rd, rs2, 0 equivalent)\n",
+                    load_inst->seqNum, store_inst->seqNum, rs2);
+
+            const uint64_t forwarded =
+                store_inst->getRegOperand(store_inst->staticInst.get(), 1);
+            if (!load_inst->memData) {
+                load_inst->memData = new uint8_t[request->mainReq()->getSize()];
+            }
+            std::memcpy(load_inst->memData, &forwarded,
+                        request->mainReq()->getSize());
+
+            PacketPtr data_pkt = new Packet(request->mainReq(), MemCmd::ReadReq);
+            data_pkt->dataStatic(load_inst->memData);
+            WritebackEvent *wb = new WritebackEvent(load_inst, data_pkt, this);
+            cpu->schedule(wb, curTick());
+
+            DPRINTF(LSQUnit,
+                    "fake_load rs2 forwarding value [sn:%llu] value=%#llx\n",
+                    load_inst->seqNum, forwarded);
+            return NoFault;
+        }
+
+        if (!inflight_match) {
+            DPRINTF(LSQUnit,
+                    "fake_load no inflight fake_store match [sn:%llu] rs1=%u off=%d\n",
+                    load_inst->seqNum, sig.rs1, sig.offset);
+            if (tryFakeStoreBufferForward(load_inst, sig, request->mainReq())) {
+                return NoFault;
+            }
+        }
+    }
+
     // Check the SQ for any previous stores that might lead to forwarding
     auto store_it = load_inst->sqIt;
     assert (store_it >= storeWBIt);
@@ -1654,6 +1809,11 @@ LSQUnit::write(LSQRequest *request, uint8_t *data, ssize_t store_idx)
         !request->req()->isCacheMaintenance() &&
         !request->req()->isAtomic())
         memcpy(storeQueue[store_idx].data(), data, size);
+
+    updateFakeStoreBuffer(storeQueue[store_idx].instruction(),
+                          reinterpret_cast<const uint8_t *>(
+                              storeQueue[store_idx].data()),
+                          size);
 
     // This function only writes the data to the store queue, so no fault
     // can happen here.
