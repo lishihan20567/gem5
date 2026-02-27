@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <array>
 #include <map>
 #include <memory>
 #include <queue>
@@ -518,6 +519,39 @@ class LSQUnit
 
     /** Flag for memory model. */
     bool needsTSO;
+
+    struct FakeStoreSignature
+    {
+        uint16_t rs1 = 0;
+        int16_t offset = 0;
+
+        bool
+        operator==(const FakeStoreSignature &rhs) const
+        {
+            return rs1 == rhs.rs1 && offset == rhs.offset;
+        }
+    };
+
+    struct FakeStoreBufferEntry
+    {
+        bool valid = false;
+        FakeStoreSignature sig;
+        uint64_t data = 0;
+        InstSeqNum seqNum = 0;
+    };
+
+    static constexpr unsigned FakeStoreBufferSize = 64;
+    std::array<FakeStoreBufferEntry, FakeStoreBufferSize> fakeStoreBuffer;
+    unsigned fakeStoreBufferHead = 0;
+
+    bool isFakeLoad(const DynInstPtr &inst) const;
+    bool isFakeStore(const DynInstPtr &inst) const;
+    FakeStoreSignature getFakeStoreSignature(const DynInstPtr &inst) const;
+    void updateFakeStoreBuffer(const DynInstPtr &inst, const uint8_t *data,
+                               size_t size);
+    bool tryFakeStoreBufferForward(const DynInstPtr &load_inst,
+                                   const FakeStoreSignature &sig,
+                                   const RequestPtr &req);
 
   protected:
     // Will also need how many read/write ports the Dcache has.  Or keep track
